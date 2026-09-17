@@ -135,6 +135,13 @@ const CONFIG = {
   overpassChunkDelayMs: 400,  // ennyit várunk két Overpass-hívás között, hogy ne terheljük túl a közösségi szervert
   overpassMaxQueryNodes: 1200, // hosszú útvonalnál ennyi (ritkított) node-ra korlátozzuk a lekérdezést — enélkül egy 150+ km-es út
                                 // több ezer node-ot jelentene, ami a publikus Overpass szerveren szinte biztosan időtúllépést okozna
+  // Ha az OSRM demó szerver nem ad vissza (vagy csak nagyon részlegesen ad vissza) valódi OSM
+  // node-azonosítókat, a node-ID alapú pontos illesztés használhatatlan — ilyenkor koordináta
+  // alapú tartalék lekérdezésre váltunk (lásd fetchWaysNearCoords). Ez lassabb, ezért kevesebb
+  // mintaponttal és kisebb csomagokban dolgozunk.
+  overpassAroundMaxSamples: 400,
+  overpassAroundChunkSize: 40,
+  overpassAroundRadiusM: 25,
   fallbackSpeedKmh: 50,         // ha egy szakaszhoz VALÓBAN semmilyen adat nincs (se tag, se útosztály), ezzel a becsléssel számol a "hivatalos idő"
   speedBuckets: [
     { max: 50, color: "#2f9e44" },
@@ -175,6 +182,34 @@ function haversineKm(a, b){
   const lat1 = toRad(a[0]), lat2 = toRad(b[0]);
   const h = Math.sin(dLat/2)**2 + Math.cos(lat1)*Math.cos(lat2)*Math.sin(dLon/2)**2;
   return 2*R*Math.asin(Math.min(1, Math.sqrt(h)));
+}
+// Pont és egy útvonal-szakasz (line segment) közötti legrövidebb távolság, sík közelítéssel
+// (kis, néhány tíz méteres távolságoknál ez elég pontos, és sokkal olcsóbb, mint pontos
+// gömbi számítás minden node-párra).
+function pointToSegmentKm(p, a, b){
+  const latRef = p[0] * Math.PI/180;
+  const kx = 111.320 * Math.cos(latRef), ky = 110.574; // km / fok, hozzávetőleg p szélességénél
+  const px = p[1]*kx, py = p[0]*ky;
+  const ax = a[1]*kx, ay = a[0]*ky;
+  const bx = b[1]*kx, by = b[0]*ky;
+  const dx = bx-ax, dy = by-ay;
+  const len2 = dx*dx + dy*dy;
+  let t = len2 ? ((px-ax)*dx + (py-ay)*dy) / len2 : 0;
+  t = Math.max(0, Math.min(1, t));
+  const cx = ax + t*dx, cy = ay + t*dy;
+  return Math.hypot(px-cx, py-cy);
+}
+// Pont és egy teljes út (több szakaszból álló vonal) közötti legrövidebb távolság — ez a teljes
+// vonalhoz méri a távolságot, nem csak a legközelebbi node-hoz, ezért nem tévedhet el pl. egy
+// hosszú, ritkán node-olt egyenes szakasznál.
+function pointToWayKm(p, wayCoords){
+  if(wayCoords.length === 1) return haversineKm(p, wayCoords[0]);
+  let min = Infinity;
+  for(let i=1;i<wayCoords.length;i++){
+    const d = pointToSegmentKm(p, wayCoords[i-1], wayCoords[i]);
+    if(d < min) min = d;
+  }
+  return min;
 }
 function formatKm(km){ return km.toFixed(1).replace(".", ",") + " km"; }
 function formatHours(h){
@@ -378,10 +413,81 @@ async function fetchWaysContainingNodes(nodeIds){
     }
     if(i < chunks.length-1) await sleep(CONFIG.overpassChunkDelayMs);
   }
-  if(failedChunks > 0 && failedChunks === chunks.length){
-    throw new Error(`Egyik Overpass lekérdezési szakasz sem sikerült (${chunks.length} próbálkozásból) — legutóbbi hiba: ${lastErrorDetail}`);
+  // Szándékosan NEM dobunk hibát akkor sem, ha minden chunk sikertelen volt (vagy egyszerűen
+  // nem talált egyetlen way-t sem a megadott node ID-khoz) — ezt a hívó fél a visszaadott
+  // "matched" aránnyal értékeli ki, és ha az nagyon alacsony, koordináta alapú tartalék
+  // módszerre vált (lásd fetchWaysNearCoords és calculateRoute).
+  return { nodeToInfo, failedChunks, totalChunks: chunks.length, lastErrorDetail };
+}
+
+// TARTALÉK MÓDSZER: ha az OSRM nem ad (vagy csak alig ad) valódi OSM node-azonosítót az útvonalhoz
+// — ez néhány publikus OSRM demó build-nél előfordul —, a node-ID alapú illesztés használhatatlan.
+// Ilyenkor koordináta alapján kérdezzük le a közeli utakat: minden mintavételezett ponthoz egy szűk
+// sugarú kört veszünk (way(around:...)), és a kapott út-GEOMETRIÁK közül (nem csak a legközelebbi
+// node-hoz, hanem a teljes vonalhoz mérve, lásd pointToWayKm) a ténylegesen legközelebbi utat
+// választjuk — ez pontosabb, mint az eredeti, kizárólag legközelebbi node-ra hagyatkozó módszer,
+// amit a felhasználó korábban hibásnak jelzett.
+async function fetchWaysNearCoords(coords, radiusM){
+  const chunks = chunk(coords, CONFIG.overpassAroundChunkSize);
+  const wayCandidates = [];
+  let failedChunks = 0;
+  let lastErrorDetail = "";
+  for(let i=0;i<chunks.length;i++){
+    const pts = chunks[i];
+    const clauses = pts.map(([lat,lon]) => `way(around:${radiusM},${lat.toFixed(6)},${lon.toFixed(6)})[highway];`).join("");
+    const q = `[out:json][timeout:40];(${clauses});out geom;`;
+    const controller = new AbortController();
+    const timer = setTimeout(()=>controller.abort(), CONFIG.overpassTimeoutMs);
+    try{
+      const res = await fetch(CONFIG.overpassUrl, {
+        method: "POST", body: "data=" + encodeURIComponent(q), signal: controller.signal,
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      });
+      if(!res.ok){
+        const bodyText = await res.text().catch(()=>"");
+        throw new Error(`Overpass HTTP ${res.status}${bodyText ? " — " + bodyText.slice(0,200) : ""}`);
+      }
+      const data = await res.json();
+      for(const el of (data.elements||[])){
+        if(el.type !== "way" || !el.geometry || !el.geometry.length) continue;
+        wayCandidates.push({ tags: el.tags, coords: el.geometry.map(g=>[g.lat, g.lon]) });
+      }
+    } catch(err){
+      failedChunks++;
+      lastErrorDetail = err.name === "AbortError" ? "időtúllépés" : err.message;
+      console.warn(`Overpass around-lekérdezés ${i+1}/${chunks.length} sikertelen:`, err);
+    } finally {
+      clearTimeout(timer);
+    }
+    if(i < chunks.length-1) await sleep(CONFIG.overpassChunkDelayMs);
   }
-  return { nodeToInfo, failedChunks, totalChunks: chunks.length };
+  if(chunks.length > 0 && failedChunks === chunks.length){
+    throw new Error(`Egyik koordináta alapú Overpass lekérdezés sem sikerült (${chunks.length} próbálkozásból) — legutóbbi hiba: ${lastErrorDetail}`);
+  }
+  const radiusKm = radiusM / 1000;
+  return coords.map(p => {
+    let best = null, bestDist = Infinity;
+    for(const w of wayCandidates){
+      const d = pointToWayKm(p, w.coords);
+      if(d < bestDist){ bestDist = d; best = w; }
+    }
+    if(!best || bestDist > radiusKm * 1.5) return null;
+    return effectiveSpeed(best.tags);
+  });
+}
+
+// Mintavételezett pontokhoz tartozó infó-objektumokat "szétteríti" a teljes (nem ritkított)
+// tömbre: minden index a hozzá (útvonal-sorrend szerint) legközelebbi mintaponttól örökli az
+// adatot, a szomszédos minták közti felező pontnál váltva.
+function fillInfosFromSamples(length, sampleIdx, sampleInfos){
+  const infos = new Array(length).fill(null);
+  for(let k=0;k<sampleIdx.length;k++){
+    const info = sampleInfos[k];
+    const rangeStart = k===0 ? 0 : Math.ceil((sampleIdx[k-1]+sampleIdx[k])/2);
+    const rangeEnd = k===sampleIdx.length-1 ? length : Math.ceil((sampleIdx[k]+sampleIdx[k+1])/2);
+    for(let i=rangeStart;i<rangeEnd;i++) infos[i] = info;
+  }
+  return infos;
 }
 
 // ============================= SZAKASZOLÁS =============================
@@ -433,34 +539,54 @@ async function calculateRoute(){
   try{
     const route = await fetchRoute(fromPoint, toPoint);
 
-    const sampleIdx = thinIndices(route.nodes.length, CONFIG.overpassMaxQueryNodes);
-    if(sampleIdx.length < route.nodes.length){
-      setStatus(`Sebességkorlát-adatok lekérése (Overpass) — hosszú útvonal (${Math.round(route.distanceKm)} km), ezért ritkítva, kb. ${sampleIdx.length} ponton kérdezzük le…`);
-    } else {
-      setStatus("Sebességkorlát-adatok lekérése (Overpass) — hosszabb útvonalnál ez akár egy-két percig is eltarthat…");
-    }
-
-    let infos = route.coords.map(()=>null);
+    let infos = new Array(route.coords.length).fill(null);
     let overpassFailed = false;
     let overpassErrorDetail = "";
     let partialFailure = false;
+    let usedFallback = false;
+
     try{
+      // 1. próbálkozás: pontos illesztés valódi OSM node-azonosítók alapján (gyors, pontos).
+      const sampleIdx = thinIndices(route.nodes.length, CONFIG.overpassMaxQueryNodes);
       const sampleNodeIds = sampleIdx.map(i => route.nodes[i]);
-      const { nodeToInfo, failedChunks, totalChunks } = await fetchWaysContainingNodes(sampleNodeIds);
-      // minden node a hozzá (útvonal-index szerint) legközelebbi lekérdezett pont adatát kapja
-      infos = new Array(route.nodes.length).fill(null);
-      for(let k=0;k<sampleIdx.length;k++){
-        const nid = route.nodes[sampleIdx[k]];
-        const info = nid!=null && nodeToInfo.has(nid) ? nodeToInfo.get(nid) : null;
-        const rangeStart = k===0 ? 0 : Math.ceil((sampleIdx[k-1]+sampleIdx[k])/2);
-        const rangeEnd = k===sampleIdx.length-1 ? route.nodes.length : Math.ceil((sampleIdx[k]+sampleIdx[k+1])/2);
-        for(let i=rangeStart;i<rangeEnd;i++) infos[i] = info;
+      const hasAnyNodeIds = sampleNodeIds.some(id => id != null);
+
+      let matchedCount = 0;
+      let nodeFailedChunks = 0, nodeTotalChunks = 0, nodeLastError = "";
+      if(hasAnyNodeIds){
+        setStatus(sampleIdx.length < route.nodes.length
+          ? `Sebességkorlát-adatok lekérése (Overpass, node-azonosítók alapján) — hosszú útvonal, ~${sampleIdx.length} ponton…`
+          : "Sebességkorlát-adatok lekérése (Overpass, node-azonosítók alapján)…");
+        const res = await fetchWaysContainingNodes(sampleNodeIds);
+        nodeFailedChunks = res.failedChunks; nodeTotalChunks = res.totalChunks; nodeLastError = res.lastErrorDetail;
+        const sampleInfos = sampleIdx.map(i => {
+          const nid = route.nodes[i];
+          const info = nid!=null && res.nodeToInfo.has(nid) ? res.nodeToInfo.get(nid) : null;
+          if(info) matchedCount++;
+          return info;
+        });
+        infos = fillInfosFromSamples(route.coords.length, sampleIdx, sampleInfos);
       }
-      partialFailure = failedChunks > 0;
-      if(partialFailure) console.warn(`${failedChunks}/${totalChunks} Overpass szakasz sikertelen volt.`);
+
+      // Ha a node-ID alapú módszer gyakorlatilag semmit nem talált (nincs node-azonosító, vagy
+      // Overpass nem tudott hozzájuk way-t találni), az valószínűleg azt jelenti, hogy az OSRM
+      // demó szerver ehhez az útvonalhoz nem ad használható node-adatot — koordináta alapú
+      // tartalék módszerre váltunk, ami nem függ ettől.
+      const matchRatio = sampleIdx.length ? matchedCount / sampleIdx.length : 0;
+      if(!hasAnyNodeIds || matchRatio < 0.15){
+        usedFallback = true;
+        const fallbackIdx = thinIndices(route.coords.length, CONFIG.overpassAroundMaxSamples);
+        setStatus(`A node-azonosítók alapján nem sikerült sebességadatot találni ehhez az útvonalhoz — koordináta alapú tartalék lekérdezésre váltunk (${fallbackIdx.length} pont, ez lassabb lehet)…`);
+        const fallbackInfos = await fetchWaysNearCoords(fallbackIdx.map(i => route.coords[i]), CONFIG.overpassAroundRadiusM);
+        infos = fillInfosFromSamples(route.coords.length, fallbackIdx, fallbackInfos);
+      } else if(nodeFailedChunks > 0){
+        partialFailure = true;
+        console.warn(`${nodeFailedChunks}/${nodeTotalChunks} Overpass szakasz sikertelen volt (legutóbbi hiba: ${nodeLastError}).`);
+      }
     } catch(err){
       overpassFailed = true;
       overpassErrorDetail = err.message;
+      infos = new Array(route.coords.length).fill(null);
       console.warn("Overpass lekérdezés sikertelen, 'nincs adat' szakaszokkal folytatjuk:", err);
     }
 
@@ -475,6 +601,8 @@ async function calculateRoute(){
       ? `Az útvonal megvan, de a sebességkorlát-adatok lekérése nem sikerült (${overpassErrorDetail}) — minden szakasz 'nincs adat'-ként szerepel.`
       : partialFailure
       ? `Kész — ${segments.length} szakaszra bontva (egy részhez nem sikerült lekérni az adatot, azok 'nincs adat'-ként szerepelnek).`
+      : usedFallback
+      ? `Kész — ${segments.length} szakaszra bontva (koordináta alapú tartalék lekérdezéssel).`
       : `Kész — ${segments.length} szakaszra bontva.`, overpassFailed);
   } catch(err){
     console.error(err);
