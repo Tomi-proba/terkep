@@ -119,9 +119,10 @@
  *   - OSRM (demo szerver): útvonaltervezés
  *   - Overpass API: OSM útszakaszok (way-ek) maxspeed tag-je
  *
- * Adatfolyam: Nominatim -> 2 koordináta -> OSRM -> útvonal-geometria ->
- *             Overpass (az útvonal bounding boxában lévő way-ek) ->
- *             minden útvonalponthoz a legközelebbi way maxspeed-je ->
+ * Adatfolyam: Nominatim -> 2 koordináta -> OSRM (annotations=nodes) -> útvonal-geometria +
+ *             a ténylegesen bejárt OSM node ID-k -> Overpass (way(bn:...) - "melyik way tartalmazza
+ *             ezeket a node-okat") -> minden útvonal-node-hoz a RÁ ténylegesen illeszkedő way
+ *             maxspeed-je (nem távolság alapú becslés, hanem pontos node-egyezés) ->
  *             szakaszolás ott, ahol változik az érték -> szerkeszthető lista + összegzés
  * ========================================================================================= */
 
@@ -129,9 +130,8 @@ const CONFIG = {
   nominatimUrl: "https://nominatim.openstreetmap.org",
   osrmUrl: "https://router.project-osrm.org",
   overpassUrl: "https://overpass-api.de/api/interpreter",
-  overpassTimeoutMs: 25000,
-  routeResampleMeters: 150,     // ennyi méterenként mintavételezzük az OSRM útvonalat a maxspeed-hozzárendeléshez
-  overpassBboxPaddingDeg: 0.01, // kb. 1 km ráhagyás a bbox-on
+  overpassTimeoutMs: 40000,
+  overpassNodeChunkSize: 600, // ennyi OSM node ID-t kérdezünk le Overpass-hívásonként (hosszú útvonalnál több hívás lesz)
   fallbackSpeedKmh: 50,         // ha egy szakaszhoz nincs maxspeed adat, ezzel a becsléssel számol a "hivatalos idő" (a UI jelzi, hogy becslés)
   speedBuckets: [
     { max: 50, color: "#2f9e44" },
@@ -175,20 +175,6 @@ function parseMaxspeed(tag){
   const numMatch = s.match(/^(\d+(\.\d+)?)/);
   if(numMatch) return Math.round(parseFloat(numMatch[1]));
   return null; // pl. "RO:urban" jellegű, országkód-alapú, közelítéssel nem próbáljuk feloldani
-}
-
-// pont távolsága egy szakasztól (durva, sík közelítéssel — csak a "legközelebbi út" kiválasztásához kell)
-function pointToSegmentDistDeg(p, a, b){
-  const latScale = Math.cos(toRad(p[0]));
-  const px = p[1]*latScale, py = p[0];
-  const ax = a[1]*latScale, ay = a[0];
-  const bx = b[1]*latScale, by = b[0];
-  const dx = bx-ax, dy = by-ay;
-  const len2 = dx*dx+dy*dy;
-  let t = len2>0 ? ((px-ax)*dx + (py-ay)*dy)/len2 : 0;
-  t = Math.max(0, Math.min(1, t));
-  const cx = ax+t*dx, cy = ay+t*dy;
-  return Math.hypot(px-cx, py-cy);
 }
 
 // ============================= ÁLLAPOT =============================
@@ -279,8 +265,12 @@ async function reverseGeocode(lat, lon){
 
 // ============================= OSRM =============================
 
+// annotations=nodes: minden útvonal-koordinátához visszakapjuk a hozzá tartozó valódi OSM node ID-t is.
+// Ez teszi lehetővé, hogy utólag PONTOSAN (nem távolság-becsléssel) tudjuk megmondani, melyik OSM way-en
+// (úton) haladunk éppen — enélkül a legközelebbi út keresése könnyen egy párhuzamos szervizútra,
+// felüljáróra vagy a másik irányú (külön way-ként tárolt) pályára tévedhet.
 async function fetchRoute(from, to){
-  const url = `${CONFIG.osrmUrl}/route/v1/driving/${from.lon},${from.lat};${to.lon},${to.lat}?overview=full&geometries=geojson`;
+  const url = `${CONFIG.osrmUrl}/route/v1/driving/${from.lon},${from.lat};${to.lon},${to.lat}?overview=full&geometries=geojson&annotations=nodes`;
   const res = await fetch(url);
   if(!res.ok) throw new Error("OSRM hiba: " + res.status);
   const data = await res.json();
@@ -288,104 +278,72 @@ async function fetchRoute(from, to){
   const route = data.routes[0];
   // GeoJSON [lon,lat] -> mi [lat,lon] sorrendben dolgozunk tovább
   const coords = route.geometry.coordinates.map(c => [c[1], c[0]]);
-  return { coords, distanceKm: route.distance/1000, durationH: route.duration/3600 };
+  // Egy leg van (nincs útközi pont), az annotation.nodes koordinátánkénti node ID-kat ad.
+  // Néhány OSRM build koordinátánként, más build szegmensenként (koordináta-1) adja vissza —
+  // mindkettőt lekezeljük, hogy a coords tömbbel pontosan egyező hosszúságú node-listát kapjunk.
+  let nodes = (route.legs && route.legs[0] && route.legs[0].annotation && route.legs[0].annotation.nodes) || [];
+  if(nodes.length === coords.length - 1) nodes = [nodes[0], ...nodes];
+  if(nodes.length !== coords.length) nodes = coords.map((_,i)=> nodes[i] ?? null);
+  return { coords, nodes, distanceKm: route.distance/1000, durationH: route.duration/3600 };
 }
 
 // ============================= OVERPASS =============================
 
-function routeBbox(coords, paddingDeg){
-  let south=90, north=-90, west=180, east=-180;
-  for(const [lat,lon] of coords){
-    south=Math.min(south,lat); north=Math.max(north,lat);
-    west=Math.min(west,lon); east=Math.max(east,lon);
-  }
-  return { south: south-paddingDeg, west: west-paddingDeg, north: north+paddingDeg, east: east+paddingDeg };
-}
-
-async function fetchSpeedWays(bbox){
-  const q = `[out:json][timeout:25];way[highway][maxspeed](${bbox.south},${bbox.west},${bbox.north},${bbox.east});out geom;`;
-  const controller = new AbortController();
-  const timer = setTimeout(()=>controller.abort(), CONFIG.overpassTimeoutMs);
-  try{
-    const res = await fetch(CONFIG.overpassUrl, {
-      method: "POST", body: "data=" + encodeURIComponent(q), signal: controller.signal,
-      headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    });
-    if(!res.ok) throw new Error("Overpass hiba: " + res.status);
-    const data = await res.json();
-    return (data.elements||[])
-      .filter(el => el.type === "way" && el.geometry && el.geometry.length>1)
-      .map(el => ({ coords: el.geometry.map(g=>[g.lat,g.lon]), maxspeed: parseMaxspeed(el.tags && el.tags.maxspeed) }));
-  } finally {
-    clearTimeout(timer);
-  }
-}
-
-function resampleRoute(coords, stepMeters){
-  if(coords.length<2) return coords;
-  const out = [coords[0]];
-  let acc = 0;
-  for(let i=1;i<coords.length;i++){
-    const segKm = haversineKm(coords[i-1], coords[i]);
-    acc += segKm*1000;
-    if(acc >= stepMeters){ out.push(coords[i]); acc = 0; }
-  }
-  if(out[out.length-1] !== coords[coords.length-1]) out.push(coords[coords.length-1]);
+function chunk(arr, size){
+  const out = [];
+  for(let i=0;i<arr.length;i+=size) out.push(arr.slice(i,i+size));
   return out;
 }
 
-// minden (mintavételezett) útvonalponthoz megkeressük a legközelebbi way maxspeed-jét
-function assignSpeedsToRoute(sampledCoords, ways){
-  return sampledCoords.map(p=>{
-    if(!ways.length) return null;
-    let best = Infinity, bestSpeed = null;
-    for(const w of ways){
-      for(let i=1;i<w.coords.length;i++){
-        const d = pointToSegmentDistDeg(p, w.coords[i-1], w.coords[i]);
-        if(d<best){ best = d; bestSpeed = w.maxspeed; }
+// Lekérdezzük Overpass-től, hogy az adott OSM node ID-kat mely way-ek (utak) tartalmazzák,
+// és azoknak mi a maxspeed tag-je — ez a "way(bn:...)" ("by node") a lényeg: nem táv alapú
+// tippelés, hanem tényleges OSM-topológiai egyezés.
+async function fetchWaysContainingNodes(nodeIds){
+  const uniqueIds = [...new Set(nodeIds.filter(Boolean))];
+  const nodeToSpeed = new Map();
+  for(const idsChunk of chunk(uniqueIds, CONFIG.overpassNodeChunkSize)){
+    const q = `[out:json][timeout:40];node(id:${idsChunk.join(",")});way(bn)[highway][maxspeed];out body;`;
+    const controller = new AbortController();
+    const timer = setTimeout(()=>controller.abort(), CONFIG.overpassTimeoutMs);
+    try{
+      const res = await fetch(CONFIG.overpassUrl, {
+        method: "POST", body: "data=" + encodeURIComponent(q), signal: controller.signal,
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      });
+      if(!res.ok) throw new Error("Overpass hiba: " + res.status);
+      const data = await res.json();
+      for(const el of (data.elements||[])){
+        if(el.type !== "way" || !el.nodes) continue;
+        const speed = parseMaxspeed(el.tags && el.tags.maxspeed);
+        for(const nid of el.nodes) nodeToSpeed.set(nid, speed);
       }
+    } finally {
+      clearTimeout(timer);
     }
-    // kb. 300 méternél távolabbi way-t már nem fogadunk el találatnak
-    return best < 0.003 ? bestSpeed : null;
-  });
+  }
+  return nodeToSpeed;
 }
 
 // ============================= SZAKASZOLÁS =============================
 
-function buildSegments(fullCoords, sampledCoords, speeds){
-  // minden teljes-felbontású pontot a hozzá legközelebbi mintavételezett ponthoz (és annak sebességéhez) rendelünk
+function buildSegments(coords, speeds){
+  // Szándékosan NEM olvasztunk össze rövid szakaszokat a szomszédjukkal: egy 100-200 méteres
+  // település eleji/végi vagy híd okozta limitváltás pont ennyire rövid szokott lenni a
+  // valóságban is, és ha "eltüntetnénk" a szomszédja alá sorolva, épp a legfontosabb (és
+  // leggyakoribb panasz forrása) hibát okoznánk: hamis sebességet mutatnánk egy rövid szakaszra.
   const segs = [];
   let cur = null;
-  let sampleIdx = 0;
-  for(let i=0;i<fullCoords.length;i++){
-    while(sampleIdx < sampledCoords.length-1 &&
-          haversineKm(fullCoords[i], sampledCoords[sampleIdx+1]) < haversineKm(fullCoords[i], sampledCoords[sampleIdx])){
-      sampleIdx++;
-    }
-    const speed = speeds[sampleIdx];
+  for(let i=0;i<coords.length;i++){
+    const speed = speeds[i];
     if(!cur || cur.officialSpeed !== speed){
-      cur = { coords: [fullCoords[i]], officialSpeed: speed };
+      cur = { coords: [coords[i]], officialSpeed: speed, distanceKm: 0 };
       segs.push(cur);
     } else {
-      cur.coords.push(fullCoords[i]);
+      cur.distanceKm += haversineKm(coords[i-1], coords[i]);
+      cur.coords.push(coords[i]);
     }
   }
-  // túl apró (pár tíz méteres) szakaszok összeolvasztása a szomszédjával, hogy ne legyen áttekinthetetlen a lista
-  const MIN_SEG_KM = 0.3;
-  const merged = [];
-  for(const s of segs){
-    let distanceKm = 0;
-    for(let i=1;i<s.coords.length;i++) distanceKm += haversineKm(s.coords[i-1], s.coords[i]);
-    s.distanceKm = distanceKm;
-    if(merged.length && distanceKm < MIN_SEG_KM){
-      const prev = merged[merged.length-1];
-      prev.coords = prev.coords.concat(s.coords.slice(1));
-      prev.distanceKm += distanceKm;
-    } else {
-      merged.push(s);
-    }
-  }
-  return merged.map(s => ({ ...s, userSpeed: s.officialSpeed || CONFIG.fallbackSpeedKmh }));
+  return segs.map(s => ({ ...s, userSpeed: s.officialSpeed || CONFIG.fallbackSpeedKmh }));
 }
 
 // ============================= FŐ FOLYAMAT =============================
@@ -399,20 +357,18 @@ async function calculateRoute(){
   try{
     const route = await fetchRoute(fromPoint, toPoint);
 
-    setStatus("Sebességkorlát-adatok lekérése (Overpass) — ez néhány másodpercig tarthat…");
-    const sampled = resampleRoute(route.coords, CONFIG.routeResampleMeters);
-    const bbox = routeBbox(route.coords, CONFIG.overpassBboxPaddingDeg);
-    let ways = [];
+    setStatus("Sebességkorlát-adatok lekérése (Overpass) — hosszabb útvonalnál ez akár egy-két percig is eltarthat…");
+    let speeds = route.coords.map(()=>null);
     let overpassFailed = false;
     try{
-      ways = await fetchSpeedWays(bbox);
+      const nodeToSpeed = await fetchWaysContainingNodes(route.nodes);
+      speeds = route.nodes.map(nid => nid!=null && nodeToSpeed.has(nid) ? nodeToSpeed.get(nid) : null);
     } catch(err){
       overpassFailed = true;
       console.warn("Overpass lekérdezés sikertelen, 'nincs adat' szakaszokkal folytatjuk:", err);
     }
-    const speeds = ways.length ? assignSpeedsToRoute(sampled, ways) : sampled.map(()=>null);
 
-    segments = buildSegments(route.coords, sampled, speeds);
+    segments = buildSegments(route.coords, speeds);
     activeSegIndex = -1;
     renderRouteOnMap();
     renderSegmentList();
