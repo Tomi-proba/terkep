@@ -10,7 +10,7 @@ Egyetlen `index.html` fájl, build lépés nélkül. Használt szolgáltatások 
 - **Nominatim** — geokódolás (helynév/cím → koordináta)
 - **OSRM** (`router.project-osrm.org` demó szerver) — útvonaltervezés
 - **Overpass API** — OpenStreetMap `maxspeed` adatok
-- **Leaflet** + **CARTO** csempék — térkép megjelenítés
+- **Leaflet** + **Wikimedia** csempék — térkép megjelenítés
 
 ## Futtatás
 

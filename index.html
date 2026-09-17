@@ -131,8 +131,10 @@ const CONFIG = {
   osrmUrl: "https://router.project-osrm.org",
   overpassUrl: "https://overpass-api.de/api/interpreter",
   overpassTimeoutMs: 40000,
-  overpassNodeChunkSize: 500, // ennyi OSM node ID-t kérdezünk le Overpass-hívásonként (hosszú útvonalnál több hívás lesz)
-  overpassChunkDelayMs: 300,  // ennyit várunk két Overpass-hívás között, hogy ne terheljük túl a közösségi szervert
+  overpassNodeChunkSize: 250, // ennyi OSM node ID-t kérdezünk le Overpass-hívásonként — kisebb = gyorsabb, megbízhatóbb egyenként
+  overpassChunkDelayMs: 400,  // ennyit várunk két Overpass-hívás között, hogy ne terheljük túl a közösségi szervert
+  overpassMaxQueryNodes: 1200, // hosszú útvonalnál ennyi (ritkított) node-ra korlátozzuk a lekérdezést — enélkül egy 150+ km-es út
+                                // több ezer node-ot jelentene, ami a publikus Overpass szerveren szinte biztosan időtúllépést okozna
   fallbackSpeedKmh: 50,         // ha egy szakaszhoz VALÓBAN semmilyen adat nincs (se tag, se útosztály), ezzel a becsléssel számol a "hivatalos idő"
   speedBuckets: [
     { max: 50, color: "#2f9e44" },
@@ -234,14 +236,13 @@ function setStatus(msg, isError){
 
 function initMap(){
   map = L.map("map").setView([47.1625, 19.5033], 7); // Magyarország középpontja
-  // A hivatalos tile.openstreetmap.org szerver terjesztett/letöltött alkalmazásokból (pláne file://
-  // protokollról, ahol nincs Referer fejléc) blokkolja a kéréseket a használati szabályzata alapján.
-  // Ehelyett a CARTO ingyenes, kulcs nélküli, hobbi-projektekhez is engedélyezett csempéit használjuk
-  // (az adatok forrása továbbra is OpenStreetMap).
-  L.tileLayer("https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png", {
-    maxZoom: 20,
-    subdomains: "abcd",
-    attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> közreműködők &copy; <a href="https://carto.com/attributions">CARTO</a>',
+  // A hivatalos tile.openstreetmap.org szervert letöltött/terjesztett appok nem használhatják.
+  // A CARTO ingyenes csempéi mostanra API-kulcsot igényelnek. Ehelyett a Wikimedia Alapítvány
+  // saját, kifejezetten erre a célra (kulcs nélküli, harmadik fél általi beágyazásra) szánt,
+  // OSM-adatokból épített csempeszolgáltatását használjuk.
+  L.tileLayer("https://maps.wikimedia.org/osm-intl/{z}/{x}/{y}{r}.png", {
+    maxZoom: 19,
+    attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> közreműködők, csempe: <a href="https://wikimediafoundation.org/">Wikimedia</a>',
   }).addTo(map);
   routeLayerGroup = L.layerGroup().addTo(map);
   map.on("click", onMapClick);
@@ -347,6 +348,7 @@ async function fetchWaysContainingNodes(nodeIds){
   const nodeToInfo = new Map();
   const chunks = chunk(uniqueIds, CONFIG.overpassNodeChunkSize);
   let failedChunks = 0;
+  let lastErrorDetail = "";
   for(let i=0;i<chunks.length;i++){
     const idsChunk = chunks[i];
     const q = `[out:json][timeout:40];node(id:${idsChunk.join(",")});way(bn)[highway];out body;`;
@@ -357,7 +359,10 @@ async function fetchWaysContainingNodes(nodeIds){
         method: "POST", body: "data=" + encodeURIComponent(q), signal: controller.signal,
         headers: { "Content-Type": "application/x-www-form-urlencoded" },
       });
-      if(!res.ok) throw new Error("Overpass hiba: " + res.status);
+      if(!res.ok){
+        const bodyText = await res.text().catch(()=>"");
+        throw new Error(`Overpass HTTP ${res.status}${bodyText ? " — " + bodyText.slice(0,200) : ""}`);
+      }
       const data = await res.json();
       for(const el of (data.elements||[])){
         if(el.type !== "way" || !el.nodes) continue;
@@ -366,13 +371,16 @@ async function fetchWaysContainingNodes(nodeIds){
       }
     } catch(err){
       failedChunks++;
+      lastErrorDetail = err.name === "AbortError" ? "időtúllépés" : err.message;
       console.warn(`Overpass chunk ${i+1}/${chunks.length} sikertelen, a többi chunk adatával folytatjuk:`, err);
     } finally {
       clearTimeout(timer);
     }
     if(i < chunks.length-1) await sleep(CONFIG.overpassChunkDelayMs);
   }
-  if(failedChunks > 0 && failedChunks === chunks.length) throw new Error("Egyik Overpass lekérdezési szakasz sem sikerült.");
+  if(failedChunks > 0 && failedChunks === chunks.length){
+    throw new Error(`Egyik Overpass lekérdezési szakasz sem sikerült (${chunks.length} próbálkozásból) — legutóbbi hiba: ${lastErrorDetail}`);
+  }
   return { nodeToInfo, failedChunks, totalChunks: chunks.length };
 }
 
@@ -401,6 +409,21 @@ function buildSegments(coords, infos){
 
 // ============================= FŐ FOLYAMAT =============================
 
+// Hosszú útvonalnál (sok ezer OSRM-geometriapont) nem kérdezzük le MINDEN node-ot Overpass-tól —
+// ez sok, lassú, publikus szerveren könnyen elhasaló körre bontaná a lekérdezést. Ehelyett
+// (útvonal-sorrend szerint, NEM távolság szerint — ez a lényeg, ez marad topológiailag helyes)
+// ritkítunk, és a ki nem kérdezett pontok a hozzájuk (INDEX szerint) legközelebbi lekérdezett
+// pont adatát öröklik. Rövid útvonalnál (a legtöbb reális használati esetben) ez nem ritkít
+// semmit, minden node lekérdezésre kerül.
+function thinIndices(length, maxSamples){
+  if(length <= maxSamples) return Array.from({length}, (_,i)=>i);
+  const stride = Math.ceil(length / maxSamples);
+  const idx = [];
+  for(let i=0;i<length;i+=stride) idx.push(i);
+  if(idx[idx.length-1] !== length-1) idx.push(length-1);
+  return idx;
+}
+
 async function calculateRoute(){
   if(!fromPoint || !toPoint) return;
   document.getElementById("calcBtn").disabled = true;
@@ -410,17 +433,34 @@ async function calculateRoute(){
   try{
     const route = await fetchRoute(fromPoint, toPoint);
 
-    setStatus("Sebességkorlát-adatok lekérése (Overpass) — hosszabb útvonalnál ez akár egy-két percig is eltarthat…");
+    const sampleIdx = thinIndices(route.nodes.length, CONFIG.overpassMaxQueryNodes);
+    if(sampleIdx.length < route.nodes.length){
+      setStatus(`Sebességkorlát-adatok lekérése (Overpass) — hosszú útvonal (${Math.round(route.distanceKm)} km), ezért ritkítva, kb. ${sampleIdx.length} ponton kérdezzük le…`);
+    } else {
+      setStatus("Sebességkorlát-adatok lekérése (Overpass) — hosszabb útvonalnál ez akár egy-két percig is eltarthat…");
+    }
+
     let infos = route.coords.map(()=>null);
     let overpassFailed = false;
+    let overpassErrorDetail = "";
     let partialFailure = false;
     try{
-      const { nodeToInfo, failedChunks, totalChunks } = await fetchWaysContainingNodes(route.nodes);
-      infos = route.nodes.map(nid => nid!=null && nodeToInfo.has(nid) ? nodeToInfo.get(nid) : null);
+      const sampleNodeIds = sampleIdx.map(i => route.nodes[i]);
+      const { nodeToInfo, failedChunks, totalChunks } = await fetchWaysContainingNodes(sampleNodeIds);
+      // minden node a hozzá (útvonal-index szerint) legközelebbi lekérdezett pont adatát kapja
+      infos = new Array(route.nodes.length).fill(null);
+      for(let k=0;k<sampleIdx.length;k++){
+        const nid = route.nodes[sampleIdx[k]];
+        const info = nid!=null && nodeToInfo.has(nid) ? nodeToInfo.get(nid) : null;
+        const rangeStart = k===0 ? 0 : Math.ceil((sampleIdx[k-1]+sampleIdx[k])/2);
+        const rangeEnd = k===sampleIdx.length-1 ? route.nodes.length : Math.ceil((sampleIdx[k]+sampleIdx[k+1])/2);
+        for(let i=rangeStart;i<rangeEnd;i++) infos[i] = info;
+      }
       partialFailure = failedChunks > 0;
       if(partialFailure) console.warn(`${failedChunks}/${totalChunks} Overpass szakasz sikertelen volt.`);
     } catch(err){
       overpassFailed = true;
+      overpassErrorDetail = err.message;
       console.warn("Overpass lekérdezés sikertelen, 'nincs adat' szakaszokkal folytatjuk:", err);
     }
 
@@ -432,7 +472,7 @@ async function calculateRoute(){
     map.fitBounds(L.latLngBounds(route.coords));
 
     setStatus(overpassFailed
-      ? "Az útvonal megvan, de a sebességkorlát-adatok lekérése nem sikerült — minden szakasz 'nincs adat'-ként szerepel."
+      ? `Az útvonal megvan, de a sebességkorlát-adatok lekérése nem sikerült (${overpassErrorDetail}) — minden szakasz 'nincs adat'-ként szerepel.`
       : partialFailure
       ? `Kész — ${segments.length} szakaszra bontva (egy részhez nem sikerült lekérni az adatot, azok 'nincs adat'-ként szerepelnek).`
       : `Kész — ${segments.length} szakaszra bontva.`, overpassFailed);
