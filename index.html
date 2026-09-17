@@ -59,7 +59,7 @@
 </head>
 <body>
 
-<div class="disclaimer">Hobbi projekt, ingyenes nyilvános OSRM / Overpass / Nominatim szervereket használ — a sebességkorlát-adatok az OpenStreetMap közösségi adatbázisából jönnek, helyenként hiányosak vagy pontatlanok lehetnek.</div>
+<div class="disclaimer">Hobbi projekt, ingyenes nyilvános OSRM / Overpass / Nominatim szervereket használ. A sebességkorlát az OpenStreetMap adatbázisából jön: ahol nincs kitáblázott érték, ott az útosztály (pl. lakóutca, főút, autópálya) alapján BECSÜLT sebességgel számolunk — ez a lista minden szakaszánál külön jelezve van.</div>
 
 <header>
   <h1>Utazási idő / sebességkorlátozás-térkép</h1>
@@ -131,14 +131,36 @@ const CONFIG = {
   osrmUrl: "https://router.project-osrm.org",
   overpassUrl: "https://overpass-api.de/api/interpreter",
   overpassTimeoutMs: 40000,
-  overpassNodeChunkSize: 600, // ennyi OSM node ID-t kérdezünk le Overpass-hívásonként (hosszú útvonalnál több hívás lesz)
-  fallbackSpeedKmh: 50,         // ha egy szakaszhoz nincs maxspeed adat, ezzel a becsléssel számol a "hivatalos idő" (a UI jelzi, hogy becslés)
+  overpassNodeChunkSize: 500, // ennyi OSM node ID-t kérdezünk le Overpass-hívásonként (hosszú útvonalnál több hívás lesz)
+  overpassChunkDelayMs: 300,  // ennyit várunk két Overpass-hívás között, hogy ne terheljük túl a közösségi szervert
+  fallbackSpeedKmh: 50,         // ha egy szakaszhoz VALÓBAN semmilyen adat nincs (se tag, se útosztály), ezzel a becsléssel számol a "hivatalos idő"
   speedBuckets: [
     { max: 50, color: "#2f9e44" },
     { max: 90, color: "#e8a91b" },
     { max: 130, color: "#d1453b" },
   ],
   noDataColor: "#9a9d92",
+  // Magyarországon (és a legtöbb országban) a legtöbb útnak NINCS kitáblázva explicit maxspeed
+  // tagje az OSM-ben — a KRESZ útosztály szerinti ALAPÉRTELMEZETT sebességhatár érvényes rá
+  // tábla nélkül is. Ha nincs explicit "maxspeed" (vagy "maxspeed:type") tag, ezt a táblázatot
+  // használjuk becslésként a highway= osztály alapján. Ez SZÁNDÉKOSAN közelítés (nem tudjuk
+  // biztosan, lakott területen belül vagy kívül vagyunk-e), a UI jelzi, hogy ez becsült érték.
+  highwayDefaultKmh: {
+    motorway: 130, motorway_link: 60,
+    trunk: 110, trunk_link: 60,
+    primary: 90, primary_link: 50,
+    secondary: 90, secondary_link: 50,
+    tertiary: 90, tertiary_link: 50,
+    unclassified: 90,
+    residential: 50,
+    living_street: 20,
+    service: 30,
+  },
+  // néhány elterjedt "maxspeed:type" / "zone:maxspeed" érték -> km/h (HU + általános zóna-jelölések)
+  zoneTypeDefaultKmh: {
+    "hu:urban": 50, "hu:rural": 90, "hu:trunk": 110, "hu:motorway": 130, "hu:living_street": 20,
+    "urban": 50, "rural": 90, "zone20": 20, "zone30": 30, "zone40": 40, "zone50": 50,
+  },
 };
 
 // ============================= SEGÉDFÜGGVÉNYEK =============================
@@ -175,6 +197,22 @@ function parseMaxspeed(tag){
   const numMatch = s.match(/^(\d+(\.\d+)?)/);
   if(numMatch) return Math.round(parseFloat(numMatch[1]));
   return null; // pl. "RO:urban" jellegű, országkód-alapú, közelítéssel nem próbáljuk feloldani
+}
+function parseZoneType(tag){
+  if(!tag) return null;
+  return CONFIG.zoneTypeDefaultKmh[String(tag).trim().toLowerCase()] ?? null;
+}
+// Egy way tényleges (megjelenítendő) sebességét adja vissza, és jelzi, hogy ez kitáblázott
+// érték-e, vagy csak az útosztály alapján becsült — ez utóbbit a UI külön jelzi.
+function effectiveSpeed(tags){
+  tags = tags || {};
+  const signed = parseMaxspeed(tags.maxspeed);
+  if(signed != null) return { speed: signed, estimated: false };
+  const zoned = parseZoneType(tags["maxspeed:type"]) ?? parseZoneType(tags["source:maxspeed"]) ?? parseZoneType(tags["zone:maxspeed"]);
+  if(zoned != null) return { speed: zoned, estimated: true };
+  const byClass = CONFIG.highwayDefaultKmh[tags.highway];
+  if(byClass != null) return { speed: byClass, estimated: true };
+  return { speed: null, estimated: false };
 }
 
 // ============================= ÁLLAPOT =============================
@@ -295,14 +333,23 @@ function chunk(arr, size){
   return out;
 }
 
-// Lekérdezzük Overpass-től, hogy az adott OSM node ID-kat mely way-ek (utak) tartalmazzák,
-// és azoknak mi a maxspeed tag-je — ez a "way(bn:...)" ("by node") a lényeg: nem táv alapú
-// tippelés, hanem tényleges OSM-topológiai egyezés.
+function sleep(ms){ return new Promise(r=>setTimeout(r, ms)); }
+
+// Lekérdezzük Overpass-től, hogy az adott OSM node ID-kat mely way-ek (utak) tartalmazzák.
+// FONTOS: nem szűrünk [maxspeed]-re — a legtöbb útnak Magyarországon (és máshol is) NINCS
+// kitáblázott maxspeed tag-je, mert az útosztály (highway=*) önmagában implikálja a KRESZ
+// szerinti alapértelmezett sebességhatárt. Ha csak a taggelt utakat kérnénk le, a route
+// nagy része hamisan "nincs adat"-ként jelenne meg. Ehelyett minden [highway] way-t lekérünk,
+// és az effectiveSpeed() dönti el node-onként, hogy kitáblázott vagy becsült értéket kapunk.
+// Egy sikertelen chunk NEM dobja el a többi (már sikeresen lekért) chunk adatát.
 async function fetchWaysContainingNodes(nodeIds){
   const uniqueIds = [...new Set(nodeIds.filter(Boolean))];
-  const nodeToSpeed = new Map();
-  for(const idsChunk of chunk(uniqueIds, CONFIG.overpassNodeChunkSize)){
-    const q = `[out:json][timeout:40];node(id:${idsChunk.join(",")});way(bn)[highway][maxspeed];out body;`;
+  const nodeToInfo = new Map();
+  const chunks = chunk(uniqueIds, CONFIG.overpassNodeChunkSize);
+  let failedChunks = 0;
+  for(let i=0;i<chunks.length;i++){
+    const idsChunk = chunks[i];
+    const q = `[out:json][timeout:40];node(id:${idsChunk.join(",")});way(bn)[highway];out body;`;
     const controller = new AbortController();
     const timer = setTimeout(()=>controller.abort(), CONFIG.overpassTimeoutMs);
     try{
@@ -314,19 +361,24 @@ async function fetchWaysContainingNodes(nodeIds){
       const data = await res.json();
       for(const el of (data.elements||[])){
         if(el.type !== "way" || !el.nodes) continue;
-        const speed = parseMaxspeed(el.tags && el.tags.maxspeed);
-        for(const nid of el.nodes) nodeToSpeed.set(nid, speed);
+        const info = effectiveSpeed(el.tags);
+        for(const nid of el.nodes) nodeToInfo.set(nid, info);
       }
+    } catch(err){
+      failedChunks++;
+      console.warn(`Overpass chunk ${i+1}/${chunks.length} sikertelen, a többi chunk adatával folytatjuk:`, err);
     } finally {
       clearTimeout(timer);
     }
+    if(i < chunks.length-1) await sleep(CONFIG.overpassChunkDelayMs);
   }
-  return nodeToSpeed;
+  if(failedChunks > 0 && failedChunks === chunks.length) throw new Error("Egyik Overpass lekérdezési szakasz sem sikerült.");
+  return { nodeToInfo, failedChunks, totalChunks: chunks.length };
 }
 
 // ============================= SZAKASZOLÁS =============================
 
-function buildSegments(coords, speeds){
+function buildSegments(coords, infos){
   // Szándékosan NEM olvasztunk össze rövid szakaszokat a szomszédjukkal: egy 100-200 méteres
   // település eleji/végi vagy híd okozta limitváltás pont ennyire rövid szokott lenni a
   // valóságban is, és ha "eltüntetnénk" a szomszédja alá sorolva, épp a legfontosabb (és
@@ -334,9 +386,10 @@ function buildSegments(coords, speeds){
   const segs = [];
   let cur = null;
   for(let i=0;i<coords.length;i++){
-    const speed = speeds[i];
+    const speed = infos[i] ? infos[i].speed : null;
+    const estimated = infos[i] ? infos[i].estimated : false;
     if(!cur || cur.officialSpeed !== speed){
-      cur = { coords: [coords[i]], officialSpeed: speed, distanceKm: 0 };
+      cur = { coords: [coords[i]], officialSpeed: speed, estimated, distanceKm: 0 };
       segs.push(cur);
     } else {
       cur.distanceKm += haversineKm(coords[i-1], coords[i]);
@@ -358,17 +411,20 @@ async function calculateRoute(){
     const route = await fetchRoute(fromPoint, toPoint);
 
     setStatus("Sebességkorlát-adatok lekérése (Overpass) — hosszabb útvonalnál ez akár egy-két percig is eltarthat…");
-    let speeds = route.coords.map(()=>null);
+    let infos = route.coords.map(()=>null);
     let overpassFailed = false;
+    let partialFailure = false;
     try{
-      const nodeToSpeed = await fetchWaysContainingNodes(route.nodes);
-      speeds = route.nodes.map(nid => nid!=null && nodeToSpeed.has(nid) ? nodeToSpeed.get(nid) : null);
+      const { nodeToInfo, failedChunks, totalChunks } = await fetchWaysContainingNodes(route.nodes);
+      infos = route.nodes.map(nid => nid!=null && nodeToInfo.has(nid) ? nodeToInfo.get(nid) : null);
+      partialFailure = failedChunks > 0;
+      if(partialFailure) console.warn(`${failedChunks}/${totalChunks} Overpass szakasz sikertelen volt.`);
     } catch(err){
       overpassFailed = true;
       console.warn("Overpass lekérdezés sikertelen, 'nincs adat' szakaszokkal folytatjuk:", err);
     }
 
-    segments = buildSegments(route.coords, speeds);
+    segments = buildSegments(route.coords, infos);
     activeSegIndex = -1;
     renderRouteOnMap();
     renderSegmentList();
@@ -377,6 +433,8 @@ async function calculateRoute(){
 
     setStatus(overpassFailed
       ? "Az útvonal megvan, de a sebességkorlát-adatok lekérése nem sikerült — minden szakasz 'nincs adat'-ként szerepel."
+      : partialFailure
+      ? `Kész — ${segments.length} szakaszra bontva (egy részhez nem sikerült lekérni az adatot, azok 'nincs adat'-ként szerepelnek).`
       : `Kész — ${segments.length} szakaszra bontva.`, overpassFailed);
   } catch(err){
     console.error(err);
@@ -392,7 +450,7 @@ function renderRouteOnMap(){
     const color = speedColor(seg.officialSpeed);
     const line = L.polyline(seg.coords, { color, weight: 6, opacity: 0.85 });
     line.on("click", ()=>{ activeSegIndex = idx; renderSegmentList(); highlightSeg(idx); });
-    line.bindTooltip(seg.officialSpeed ? `${seg.officialSpeed} km/h` : "nincs adat");
+    line.bindTooltip(seg.officialSpeed ? `${seg.officialSpeed} km/h${seg.estimated?" (becsült)":""}` : "nincs adat");
     line.addTo(routeLayerGroup);
     seg._layer = line;
   });
@@ -414,7 +472,9 @@ function renderSegmentList(){
         <span><span class="dot" style="background:${color}"></span>${idx+1}. szakasz</span>
         <span>${formatKm(seg.distanceKm)}</span>
       </div>
-      <div class="meta">Hivatalos: ${seg.officialSpeed ? seg.officialSpeed + " km/h" : "nincs adat (becslés: " + CONFIG.fallbackSpeedKmh + " km/h-val számolva)"}</div>
+      <div class="meta">Hivatalos: ${seg.officialSpeed
+        ? seg.officialSpeed + " km/h" + (seg.estimated ? ` <span title="Nincs kitáblázott érték az OSM-ben, az útosztály (highway=*) alapján becsülve.">(becsült, útosztály alapján)</span>` : " (kitáblázott)")
+        : "nincs adat (becslés: " + CONFIG.fallbackSpeedKmh + " km/h-val számolva)"}</div>
       <div class="speedrow">
         <label>Te ennyivel mennél:</label>
         <input type="number" min="1" max="300" step="5" value="${seg.userSpeed}" data-idx="${idx}">
