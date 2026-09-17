@@ -129,7 +129,15 @@
 const CONFIG = {
   nominatimUrl: "https://nominatim.openstreetmap.org",
   osrmUrl: "https://router.project-osrm.org",
-  overpassUrl: "https://overpass-api.de/api/interpreter",
+  // Több nyilvános Overpass szervert próbálunk sorban: ha az elsőnek megadott (a "hivatalos"
+  // overpass-api.de) valamiért nem érhető el egy adott böngészőből/hosztingból (pl. CORS-ot
+  // vagy a kérést magát blokkolja — ez okozta korábban a "Failed to fetch" hibát élesben),
+  // automatikusan átváltunk a következőre, és attól kezdve azt használjuk elsőként.
+  overpassUrls: [
+    "https://overpass-api.de/api/interpreter",
+    "https://overpass.kumi.systems/api/interpreter",
+    "https://overpass.openstreetmap.ru/api/interpreter",
+  ],
   overpassTimeoutMs: 40000,
   overpassNodeChunkSize: 250, // ennyi OSM node ID-t kérdezünk le Overpass-hívásonként — kisebb = gyorsabb, megbízhatóbb egyenként
   overpassChunkDelayMs: 400,  // ennyit várunk két Overpass-hívás között, hogy ne terheljük túl a közösségi szervert
@@ -371,6 +379,44 @@ function chunk(arr, size){
 
 function sleep(ms){ return new Promise(r=>setTimeout(r, ms)); }
 
+// A legutóbb sikeresen elért Overpass szerver indexe — ezt próbáljuk elsőként a következő
+// hívásnál is, hogy ne kelljen minden egyes chunknál újra végigpróbálni a rossz szervereket.
+let workingOverpassUrlIndex = 0;
+
+// Egyetlen Overpass POST-lekérdezés, ami automatikusan átvált a következő szerverre, ha az
+// aktuális teljesen elérhetetlen (hálózati hiba vagy CORS-blokkolás — ezekre a fetch() "Failed
+// to fetch" TypeError-t dob, HTTP státusz nélkül, tehát HTTP hibaként nem lehetne megkülönböztetni
+// egy valódi szerverhibától). Csak akkor lép a következő szerverre, ha az aktuális teljesen
+// elérhetetlen volt; egy HTTP hibaválasz (pl. 400 rossz lekérdezés) nem vált szervert.
+async function overpassPost(query, timeoutMs){
+  const urls = CONFIG.overpassUrls;
+  const order = [workingOverpassUrlIndex, ...urls.map((_,i)=>i).filter(i=>i!==workingOverpassUrlIndex)];
+  let lastErr = new Error("Nincs elérhető Overpass szerver");
+  for(const idx of order){
+    const url = urls[idx];
+    const controller = new AbortController();
+    const timer = setTimeout(()=>controller.abort(), timeoutMs);
+    try{
+      const res = await fetch(url, {
+        method: "POST", body: "data=" + encodeURIComponent(query), signal: controller.signal,
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      });
+      clearTimeout(timer);
+      if(!res.ok){
+        const bodyText = await res.text().catch(()=>"");
+        throw new Error(`Overpass HTTP ${res.status}${bodyText ? " — " + bodyText.slice(0,200) : ""}`);
+      }
+      workingOverpassUrlIndex = idx;
+      return await res.json();
+    } catch(err){
+      clearTimeout(timer);
+      lastErr = err.name === "AbortError" ? new Error("időtúllépés") : err;
+      console.warn(`Overpass szerver (${url}) nem elérhető, másikra váltunk ha van:`, err);
+    }
+  }
+  throw lastErr;
+}
+
 // Lekérdezzük Overpass-től, hogy az adott OSM node ID-kat mely way-ek (utak) tartalmazzák.
 // FONTOS: nem szűrünk [maxspeed]-re — a legtöbb útnak Magyarországon (és máshol is) NINCS
 // kitáblázott maxspeed tag-je, mert az útosztály (highway=*) önmagában implikálja a KRESZ
@@ -387,18 +433,8 @@ async function fetchWaysContainingNodes(nodeIds){
   for(let i=0;i<chunks.length;i++){
     const idsChunk = chunks[i];
     const q = `[out:json][timeout:40];node(id:${idsChunk.join(",")});way(bn)[highway];out body;`;
-    const controller = new AbortController();
-    const timer = setTimeout(()=>controller.abort(), CONFIG.overpassTimeoutMs);
     try{
-      const res = await fetch(CONFIG.overpassUrl, {
-        method: "POST", body: "data=" + encodeURIComponent(q), signal: controller.signal,
-        headers: { "Content-Type": "application/x-www-form-urlencoded" },
-      });
-      if(!res.ok){
-        const bodyText = await res.text().catch(()=>"");
-        throw new Error(`Overpass HTTP ${res.status}${bodyText ? " — " + bodyText.slice(0,200) : ""}`);
-      }
-      const data = await res.json();
+      const data = await overpassPost(q, CONFIG.overpassTimeoutMs);
       for(const el of (data.elements||[])){
         if(el.type !== "way" || !el.nodes) continue;
         const info = effectiveSpeed(el.tags);
@@ -406,10 +442,8 @@ async function fetchWaysContainingNodes(nodeIds){
       }
     } catch(err){
       failedChunks++;
-      lastErrorDetail = err.name === "AbortError" ? "időtúllépés" : err.message;
+      lastErrorDetail = err.message;
       console.warn(`Overpass chunk ${i+1}/${chunks.length} sikertelen, a többi chunk adatával folytatjuk:`, err);
-    } finally {
-      clearTimeout(timer);
     }
     if(i < chunks.length-1) await sleep(CONFIG.overpassChunkDelayMs);
   }
@@ -436,28 +470,16 @@ async function fetchWaysNearCoords(coords, radiusM){
     const pts = chunks[i];
     const clauses = pts.map(([lat,lon]) => `way(around:${radiusM},${lat.toFixed(6)},${lon.toFixed(6)})[highway];`).join("");
     const q = `[out:json][timeout:40];(${clauses});out geom;`;
-    const controller = new AbortController();
-    const timer = setTimeout(()=>controller.abort(), CONFIG.overpassTimeoutMs);
     try{
-      const res = await fetch(CONFIG.overpassUrl, {
-        method: "POST", body: "data=" + encodeURIComponent(q), signal: controller.signal,
-        headers: { "Content-Type": "application/x-www-form-urlencoded" },
-      });
-      if(!res.ok){
-        const bodyText = await res.text().catch(()=>"");
-        throw new Error(`Overpass HTTP ${res.status}${bodyText ? " — " + bodyText.slice(0,200) : ""}`);
-      }
-      const data = await res.json();
+      const data = await overpassPost(q, CONFIG.overpassTimeoutMs);
       for(const el of (data.elements||[])){
         if(el.type !== "way" || !el.geometry || !el.geometry.length) continue;
         wayCandidates.push({ tags: el.tags, coords: el.geometry.map(g=>[g.lat, g.lon]) });
       }
     } catch(err){
       failedChunks++;
-      lastErrorDetail = err.name === "AbortError" ? "időtúllépés" : err.message;
+      lastErrorDetail = err.message;
       console.warn(`Overpass around-lekérdezés ${i+1}/${chunks.length} sikertelen:`, err);
-    } finally {
-      clearTimeout(timer);
     }
     if(i < chunks.length-1) await sleep(CONFIG.overpassChunkDelayMs);
   }
