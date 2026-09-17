@@ -1,0 +1,533 @@
+<!doctype html>
+<html lang="hu">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Utazási idő / sebességkorlátozás-térkép</title>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css" />
+<style>
+  :root{
+    --bg:#f5f6f4; --panel:#ffffff; --border:#dcdfd8; --border-strong:#c3c7bd;
+    --text:#1b1d19; --muted:#666a5f; --accent:#2f6b3c; --accent-fg:#ffffff; --accent-soft:#eaf0e7;
+    --bad:#b3261e;
+    --c-green:#2f9e44; --c-yellow:#e8a91b; --c-red:#d1453b; --c-grey:#9a9d92;
+  }
+  *{box-sizing:border-box;}
+  body{margin:0;background:var(--bg);color:var(--text);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;font-size:14px;}
+  header{background:var(--panel);border-bottom:1px solid var(--border);padding:12px 16px;}
+  header h1{margin:0 0 2px 0;font-size:17px;}
+  header p{margin:0;font-size:12px;color:var(--muted);}
+  .disclaimer{background:#fdf6e3;border-bottom:1px solid #e9d8a0;color:#7a5c00;padding:6px 16px;font-size:11.5px;text-align:center;}
+  .controls{display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end;padding:10px 16px;background:var(--panel);border-bottom:1px solid var(--border);}
+  .field{display:flex;flex-direction:column;gap:3px;min-width:200px;flex:1 1 220px;}
+  .field label{font-size:11.5px;color:var(--muted);text-transform:uppercase;letter-spacing:.02em;}
+  .field .row{display:flex;gap:6px;}
+  input[type=text]{flex:1;padding:7px 9px;border:1px solid var(--border-strong);border-radius:6px;font-size:13.5px;}
+  select{padding:7px 9px;border:1px solid var(--border-strong);border-radius:6px;font-size:13.5px;background:#fff;}
+  button{appearance:none;border:1px solid var(--accent);background:var(--accent);color:var(--accent-fg);padding:8px 14px;
+    border-radius:6px;font-size:13px;cursor:pointer;font-weight:600;white-space:nowrap;}
+  button.secondary{background:#fff;color:var(--text);border:1px solid var(--border-strong);}
+  button.tiny{padding:5px 8px;font-size:12px;}
+  button:disabled{opacity:.45;cursor:not-allowed;}
+  button.armed{outline:2px solid var(--accent);outline-offset:1px;}
+  .status{font-size:12px;color:var(--muted);padding:0 16px 8px;min-height:16px;}
+  .status.error{color:var(--bad);}
+  .layout{display:grid;grid-template-columns:1fr 340px;gap:0;height:calc(100vh - 168px);min-height:420px;}
+  #map{width:100%;height:100%;}
+  .side{border-left:1px solid var(--border);background:var(--panel);display:flex;flex-direction:column;overflow:hidden;}
+  .legend{display:flex;gap:10px;flex-wrap:wrap;padding:10px 12px;border-bottom:1px solid var(--border);font-size:11.5px;color:var(--muted);}
+  .legend .sw{display:inline-block;width:10px;height:10px;border-radius:2px;margin-right:4px;vertical-align:-1px;}
+  #segList{flex:1;overflow-y:auto;padding:8px 10px;}
+  .seg{border:1px solid var(--border);border-radius:7px;padding:8px 9px;margin-bottom:7px;cursor:pointer;}
+  .seg:hover{border-color:var(--border-strong);}
+  .seg.active{border-color:var(--accent);background:var(--accent-soft);}
+  .seg .top{display:flex;justify-content:space-between;align-items:center;font-size:12.5px;font-weight:600;margin-bottom:5px;}
+  .seg .dot{display:inline-block;width:9px;height:9px;border-radius:50%;margin-right:6px;}
+  .seg .meta{font-size:11.5px;color:var(--muted);margin-bottom:6px;}
+  .seg .speedrow{display:flex;align-items:center;gap:6px;font-size:12px;}
+  .seg .speedrow input{width:64px;padding:4px 6px;border:1px solid var(--border-strong);border-radius:5px;font-size:12.5px;}
+  .summary{border-top:1px solid var(--border);padding:10px 14px;background:var(--accent-soft);font-size:12.5px;}
+  .summary .grid{display:grid;grid-template-columns:1fr 1fr;gap:6px 12px;}
+  .summary .k{color:var(--muted);}
+  .summary .v{font-weight:700;text-align:right;font-variant-numeric:tabular-nums;}
+  .summary .diff{grid-column:1/-1;margin-top:6px;padding-top:6px;border-top:1px solid var(--border-strong);text-align:center;font-size:13.5px;font-weight:700;}
+  .diff.pos{color:var(--c-green);} .diff.neg{color:var(--bad);}
+  .spinner{display:inline-block;width:12px;height:12px;border:2px solid var(--border-strong);border-top-color:var(--accent);border-radius:50%;animation:spin .7s linear infinite;margin-right:6px;vertical-align:-2px;}
+  @keyframes spin{to{transform:rotate(360deg);}}
+  [hidden]{display:none!important;}
+</style>
+</head>
+<body>
+
+<div class="disclaimer">Hobbi projekt, ingyenes nyilvános OSRM / Overpass / Nominatim szervereket használ — a sebességkorlát-adatok az OpenStreetMap közösségi adatbázisából jönnek, helyenként hiányosak vagy pontatlanok lehetnek.</div>
+
+<header>
+  <h1>Utazási idő / sebességkorlátozás-térkép</h1>
+  <p>Add meg a kiinduló- és célpontot, majd hasonlítsd össze a hivatalos sebességhatárral és a saját tempóddal számolt menetidőt.</p>
+</header>
+
+<div class="controls">
+  <div class="field">
+    <label for="fromInput">Honnan</label>
+    <div class="row">
+      <input type="text" id="fromInput" placeholder="pl. Szeged, vagy egy cím">
+      <button class="secondary tiny" id="fromSearchBtn">Keresés</button>
+    </div>
+  </div>
+  <div class="field">
+    <label for="toInput">Hová</label>
+    <div class="row">
+      <input type="text" id="toInput" placeholder="pl. Budapest, vagy egy cím">
+      <button class="secondary tiny" id="toSearchBtn">Keresés</button>
+    </div>
+  </div>
+  <button class="secondary" id="pickFromBtn">📍 Kezdőpont a térképen</button>
+  <button class="secondary" id="pickToBtn">📍 Célpont a térképen</button>
+  <button id="calcBtn" disabled>Útvonal kiszámítása</button>
+</div>
+<div class="status" id="status"></div>
+
+<div class="layout">
+  <div id="map"></div>
+  <div class="side">
+    <div class="legend">
+      <span><span class="sw" style="background:var(--c-green)"></span>≤50 km/h</span>
+      <span><span class="sw" style="background:var(--c-yellow)"></span>≤90 km/h</span>
+      <span><span class="sw" style="background:var(--c-red)"></span>≤130 km/h</span>
+      <span><span class="sw" style="background:var(--c-grey)"></span>nincs adat</span>
+    </div>
+    <div id="segList"><p style="padding:12px;color:var(--muted);font-size:12.5px;">Számold ki az útvonalat, hogy itt megjelenjenek a sebességkorlát szerinti szakaszok.</p></div>
+    <div class="summary" id="summary" hidden>
+      <div class="grid">
+        <div class="k">Teljes táv</div><div class="v" id="sumDistance">—</div>
+        <div class="k">Hivatalos sebességgel</div><div class="v" id="sumOfficial">—</div>
+        <div class="k">A te sebességeiddel</div><div class="v" id="sumCustom">—</div>
+      </div>
+      <div class="diff" id="sumDiff">—</div>
+    </div>
+  </div>
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
+<script>
+"use strict";
+/* =========================================================================================
+ * UTAZÁSI IDŐ / SEBESSÉGKORLÁTOZÁS-TÉRKÉP
+ * Kedvtelésből épített, egyetlen HTML fájlban futó eszköz. Semmilyen fizetős / kulcsos API-t
+ * nem használ, csak a nyilvános OSM-alapú szolgáltatásokat:
+ *   - Nominatim: geokódolás / reverse geokódolás (helynév <-> koordináta)
+ *   - OSRM (demo szerver): útvonaltervezés
+ *   - Overpass API: OSM útszakaszok (way-ek) maxspeed tag-je
+ *
+ * Adatfolyam: Nominatim -> 2 koordináta -> OSRM -> útvonal-geometria ->
+ *             Overpass (az útvonal bounding boxában lévő way-ek) ->
+ *             minden útvonalponthoz a legközelebbi way maxspeed-je ->
+ *             szakaszolás ott, ahol változik az érték -> szerkeszthető lista + összegzés
+ * ========================================================================================= */
+
+const CONFIG = {
+  nominatimUrl: "https://nominatim.openstreetmap.org",
+  osrmUrl: "https://router.project-osrm.org",
+  overpassUrl: "https://overpass-api.de/api/interpreter",
+  overpassTimeoutMs: 25000,
+  routeResampleMeters: 150,     // ennyi méterenként mintavételezzük az OSRM útvonalat a maxspeed-hozzárendeléshez
+  overpassBboxPaddingDeg: 0.01, // kb. 1 km ráhagyás a bbox-on
+  fallbackSpeedKmh: 50,         // ha egy szakaszhoz nincs maxspeed adat, ezzel a becsléssel számol a "hivatalos idő" (a UI jelzi, hogy becslés)
+  speedBuckets: [
+    { max: 50, color: "#2f9e44" },
+    { max: 90, color: "#e8a91b" },
+    { max: 130, color: "#d1453b" },
+  ],
+  noDataColor: "#9a9d92",
+};
+
+// ============================= SEGÉDFÜGGVÉNYEK =============================
+
+function toRad(d){ return d*Math.PI/180; }
+function haversineKm(a, b){
+  const R = 6371;
+  const dLat = toRad(b[0]-a[0]);
+  const dLon = toRad(b[1]-a[1]);
+  const lat1 = toRad(a[0]), lat2 = toRad(b[0]);
+  const h = Math.sin(dLat/2)**2 + Math.cos(lat1)*Math.cos(lat2)*Math.sin(dLon/2)**2;
+  return 2*R*Math.asin(Math.min(1, Math.sqrt(h)));
+}
+function formatKm(km){ return km.toFixed(1).replace(".", ",") + " km"; }
+function formatHours(h){
+  if(!isFinite(h) || h<=0) return "0 perc";
+  const totalMin = Math.round(h*60);
+  const hh = Math.floor(totalMin/60), mm = totalMin%60;
+  if(hh<=0) return `${mm} perc`;
+  return `${hh} óra ${mm} perc`;
+}
+function speedColor(kmh){
+  if(kmh==null) return CONFIG.noDataColor;
+  for(const b of CONFIG.speedBuckets) if(kmh<=b.max) return b.color;
+  return CONFIG.speedBuckets[CONFIG.speedBuckets.length-1].color;
+}
+// OSM maxspeed tag közelítő értelmezése: "50", "50 mph", "RO:urban" stb.
+function parseMaxspeed(tag){
+  if(!tag) return null;
+  const s = String(tag).trim().toLowerCase();
+  if(s === "none" || s === "signals" || s === "walk" || s === "variable") return null;
+  const mphMatch = s.match(/^(\d+(\.\d+)?)\s*mph$/);
+  if(mphMatch) return Math.round(parseFloat(mphMatch[1]) * 1.60934);
+  const numMatch = s.match(/^(\d+(\.\d+)?)/);
+  if(numMatch) return Math.round(parseFloat(numMatch[1]));
+  return null; // pl. "RO:urban" jellegű, országkód-alapú, közelítéssel nem próbáljuk feloldani
+}
+
+// pont távolsága egy szakasztól (durva, sík közelítéssel — csak a "legközelebbi út" kiválasztásához kell)
+function pointToSegmentDistDeg(p, a, b){
+  const latScale = Math.cos(toRad(p[0]));
+  const px = p[1]*latScale, py = p[0];
+  const ax = a[1]*latScale, ay = a[0];
+  const bx = b[1]*latScale, by = b[0];
+  const dx = bx-ax, dy = by-ay;
+  const len2 = dx*dx+dy*dy;
+  let t = len2>0 ? ((px-ax)*dx + (py-ay)*dy)/len2 : 0;
+  t = Math.max(0, Math.min(1, t));
+  const cx = ax+t*dx, cy = ay+t*dy;
+  return Math.hypot(px-cx, py-cy);
+}
+
+// ============================= ÁLLAPOT =============================
+
+let map, routeLayerGroup;
+let fromPoint = null, toPoint = null; // { lat, lon, label }
+let fromMarker = null, toMarker = null;
+let pickMode = null; // "from" | "to" | null
+let segments = []; // { coords:[[lat,lon],...], distanceKm, officialSpeed:number|null, userSpeed:number }
+let activeSegIndex = -1;
+
+const statusEl = document.getElementById("status");
+function setStatus(msg, isError){
+  statusEl.textContent = msg || "";
+  statusEl.classList.toggle("error", !!isError);
+}
+
+// ============================= TÉRKÉP =============================
+
+function initMap(){
+  map = L.map("map").setView([47.1625, 19.5033], 7); // Magyarország középpontja
+  // A hivatalos tile.openstreetmap.org szerver terjesztett/letöltött alkalmazásokból (pláne file://
+  // protokollról, ahol nincs Referer fejléc) blokkolja a kéréseket a használati szabályzata alapján.
+  // Ehelyett a CARTO ingyenes, kulcs nélküli, hobbi-projektekhez is engedélyezett csempéit használjuk
+  // (az adatok forrása továbbra is OpenStreetMap).
+  L.tileLayer("https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png", {
+    maxZoom: 20,
+    subdomains: "abcd",
+    attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> közreműködők &copy; <a href="https://carto.com/attributions">CARTO</a>',
+  }).addTo(map);
+  routeLayerGroup = L.layerGroup().addTo(map);
+  map.on("click", onMapClick);
+}
+
+function onMapClick(e){
+  if(!pickMode) return;
+  const { lat, lng } = e.latlng;
+  setPoint(pickMode, { lat, lon: lng, label: `${lat.toFixed(5)}, ${lng.toFixed(5)}` });
+  reverseGeocode(lat, lng).then(label=>{
+    if(label){
+      if(pickMode === "from"){ fromPoint.label = label; document.getElementById("fromInput").value = label; }
+      // pickMode változhatott már mire visszaér a válasz, ezért külön ellenőrzünk lentebb is
+    }
+  }).catch(()=>{});
+  const el = pickMode === "from" ? document.getElementById("fromInput") : document.getElementById("toInput");
+  el.value = `${lat.toFixed(5)}, ${lng.toFixed(5)}`;
+  armPickMode(null);
+}
+
+function setPoint(which, point){
+  if(which === "from"){
+    fromPoint = point;
+    if(fromMarker) map.removeLayer(fromMarker);
+    fromMarker = L.marker([point.lat, point.lon], { title: "Kezdőpont" }).addTo(map);
+  } else {
+    toPoint = point;
+    if(toMarker) map.removeLayer(toMarker);
+    toMarker = L.marker([point.lat, point.lon], { title: "Célpont" }).addTo(map);
+  }
+  document.getElementById("calcBtn").disabled = !(fromPoint && toPoint);
+}
+
+function armPickMode(mode){
+  pickMode = mode;
+  document.getElementById("pickFromBtn").classList.toggle("armed", mode==="from");
+  document.getElementById("pickToBtn").classList.toggle("armed", mode==="to");
+  document.getElementById("map").style.cursor = mode ? "crosshair" : "";
+  setStatus(mode ? "Kattints a térképre a pont kijelöléséhez…" : "");
+}
+
+// ============================= NOMINATIM =============================
+
+async function geocode(query){
+  const url = `${CONFIG.nominatimUrl}/search?format=json&limit=1&q=${encodeURIComponent(query)}`;
+  const res = await fetch(url, { headers: { "Accept": "application/json" } });
+  if(!res.ok) throw new Error("Nominatim hiba: " + res.status);
+  const data = await res.json();
+  if(!data.length) throw new Error("Nem található ilyen hely: " + query);
+  return { lat: parseFloat(data[0].lat), lon: parseFloat(data[0].lon), label: data[0].display_name };
+}
+async function reverseGeocode(lat, lon){
+  const url = `${CONFIG.nominatimUrl}/reverse?format=json&lat=${lat}&lon=${lon}`;
+  const res = await fetch(url, { headers: { "Accept": "application/json" } });
+  if(!res.ok) return null;
+  const data = await res.json();
+  return data.display_name || null;
+}
+
+// ============================= OSRM =============================
+
+async function fetchRoute(from, to){
+  const url = `${CONFIG.osrmUrl}/route/v1/driving/${from.lon},${from.lat};${to.lon},${to.lat}?overview=full&geometries=geojson`;
+  const res = await fetch(url);
+  if(!res.ok) throw new Error("OSRM hiba: " + res.status);
+  const data = await res.json();
+  if(data.code !== "Ok" || !data.routes || !data.routes.length) throw new Error("Nem található útvonal (OSRM: " + data.code + ")");
+  const route = data.routes[0];
+  // GeoJSON [lon,lat] -> mi [lat,lon] sorrendben dolgozunk tovább
+  const coords = route.geometry.coordinates.map(c => [c[1], c[0]]);
+  return { coords, distanceKm: route.distance/1000, durationH: route.duration/3600 };
+}
+
+// ============================= OVERPASS =============================
+
+function routeBbox(coords, paddingDeg){
+  let south=90, north=-90, west=180, east=-180;
+  for(const [lat,lon] of coords){
+    south=Math.min(south,lat); north=Math.max(north,lat);
+    west=Math.min(west,lon); east=Math.max(east,lon);
+  }
+  return { south: south-paddingDeg, west: west-paddingDeg, north: north+paddingDeg, east: east+paddingDeg };
+}
+
+async function fetchSpeedWays(bbox){
+  const q = `[out:json][timeout:25];way[highway][maxspeed](${bbox.south},${bbox.west},${bbox.north},${bbox.east});out geom;`;
+  const controller = new AbortController();
+  const timer = setTimeout(()=>controller.abort(), CONFIG.overpassTimeoutMs);
+  try{
+    const res = await fetch(CONFIG.overpassUrl, {
+      method: "POST", body: "data=" + encodeURIComponent(q), signal: controller.signal,
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    });
+    if(!res.ok) throw new Error("Overpass hiba: " + res.status);
+    const data = await res.json();
+    return (data.elements||[])
+      .filter(el => el.type === "way" && el.geometry && el.geometry.length>1)
+      .map(el => ({ coords: el.geometry.map(g=>[g.lat,g.lon]), maxspeed: parseMaxspeed(el.tags && el.tags.maxspeed) }));
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function resampleRoute(coords, stepMeters){
+  if(coords.length<2) return coords;
+  const out = [coords[0]];
+  let acc = 0;
+  for(let i=1;i<coords.length;i++){
+    const segKm = haversineKm(coords[i-1], coords[i]);
+    acc += segKm*1000;
+    if(acc >= stepMeters){ out.push(coords[i]); acc = 0; }
+  }
+  if(out[out.length-1] !== coords[coords.length-1]) out.push(coords[coords.length-1]);
+  return out;
+}
+
+// minden (mintavételezett) útvonalponthoz megkeressük a legközelebbi way maxspeed-jét
+function assignSpeedsToRoute(sampledCoords, ways){
+  return sampledCoords.map(p=>{
+    if(!ways.length) return null;
+    let best = Infinity, bestSpeed = null;
+    for(const w of ways){
+      for(let i=1;i<w.coords.length;i++){
+        const d = pointToSegmentDistDeg(p, w.coords[i-1], w.coords[i]);
+        if(d<best){ best = d; bestSpeed = w.maxspeed; }
+      }
+    }
+    // kb. 300 méternél távolabbi way-t már nem fogadunk el találatnak
+    return best < 0.003 ? bestSpeed : null;
+  });
+}
+
+// ============================= SZAKASZOLÁS =============================
+
+function buildSegments(fullCoords, sampledCoords, speeds){
+  // minden teljes-felbontású pontot a hozzá legközelebbi mintavételezett ponthoz (és annak sebességéhez) rendelünk
+  const segs = [];
+  let cur = null;
+  let sampleIdx = 0;
+  for(let i=0;i<fullCoords.length;i++){
+    while(sampleIdx < sampledCoords.length-1 &&
+          haversineKm(fullCoords[i], sampledCoords[sampleIdx+1]) < haversineKm(fullCoords[i], sampledCoords[sampleIdx])){
+      sampleIdx++;
+    }
+    const speed = speeds[sampleIdx];
+    if(!cur || cur.officialSpeed !== speed){
+      cur = { coords: [fullCoords[i]], officialSpeed: speed };
+      segs.push(cur);
+    } else {
+      cur.coords.push(fullCoords[i]);
+    }
+  }
+  // túl apró (pár tíz méteres) szakaszok összeolvasztása a szomszédjával, hogy ne legyen áttekinthetetlen a lista
+  const MIN_SEG_KM = 0.3;
+  const merged = [];
+  for(const s of segs){
+    let distanceKm = 0;
+    for(let i=1;i<s.coords.length;i++) distanceKm += haversineKm(s.coords[i-1], s.coords[i]);
+    s.distanceKm = distanceKm;
+    if(merged.length && distanceKm < MIN_SEG_KM){
+      const prev = merged[merged.length-1];
+      prev.coords = prev.coords.concat(s.coords.slice(1));
+      prev.distanceKm += distanceKm;
+    } else {
+      merged.push(s);
+    }
+  }
+  return merged.map(s => ({ ...s, userSpeed: s.officialSpeed || CONFIG.fallbackSpeedKmh }));
+}
+
+// ============================= FŐ FOLYAMAT =============================
+
+async function calculateRoute(){
+  if(!fromPoint || !toPoint) return;
+  document.getElementById("calcBtn").disabled = true;
+  setStatus("Útvonal lekérése (OSRM)…");
+  routeLayerGroup.clearLayers();
+  document.getElementById("summary").hidden = true;
+  try{
+    const route = await fetchRoute(fromPoint, toPoint);
+
+    setStatus("Sebességkorlát-adatok lekérése (Overpass) — ez néhány másodpercig tarthat…");
+    const sampled = resampleRoute(route.coords, CONFIG.routeResampleMeters);
+    const bbox = routeBbox(route.coords, CONFIG.overpassBboxPaddingDeg);
+    let ways = [];
+    let overpassFailed = false;
+    try{
+      ways = await fetchSpeedWays(bbox);
+    } catch(err){
+      overpassFailed = true;
+      console.warn("Overpass lekérdezés sikertelen, 'nincs adat' szakaszokkal folytatjuk:", err);
+    }
+    const speeds = ways.length ? assignSpeedsToRoute(sampled, ways) : sampled.map(()=>null);
+
+    segments = buildSegments(route.coords, sampled, speeds);
+    activeSegIndex = -1;
+    renderRouteOnMap();
+    renderSegmentList();
+    updateSummary();
+    map.fitBounds(L.latLngBounds(route.coords));
+
+    setStatus(overpassFailed
+      ? "Az útvonal megvan, de a sebességkorlát-adatok lekérése nem sikerült — minden szakasz 'nincs adat'-ként szerepel."
+      : `Kész — ${segments.length} szakaszra bontva.`, overpassFailed);
+  } catch(err){
+    console.error(err);
+    setStatus("Hiba történt: " + err.message, true);
+  } finally {
+    document.getElementById("calcBtn").disabled = false;
+  }
+}
+
+function renderRouteOnMap(){
+  routeLayerGroup.clearLayers();
+  segments.forEach((seg, idx)=>{
+    const color = speedColor(seg.officialSpeed);
+    const line = L.polyline(seg.coords, { color, weight: 6, opacity: 0.85 });
+    line.on("click", ()=>{ activeSegIndex = idx; renderSegmentList(); highlightSeg(idx); });
+    line.bindTooltip(seg.officialSpeed ? `${seg.officialSpeed} km/h` : "nincs adat");
+    line.addTo(routeLayerGroup);
+    seg._layer = line;
+  });
+}
+function highlightSeg(idx){
+  segments.forEach((s,i)=> s._layer && s._layer.setStyle({ weight: i===idx?9:6 }));
+  if(segments[idx]) map.panTo(segments[idx].coords[Math.floor(segments[idx].coords.length/2)]);
+}
+
+function renderSegmentList(){
+  const wrap = document.getElementById("segList");
+  wrap.innerHTML = "";
+  segments.forEach((seg, idx)=>{
+    const div = document.createElement("div");
+    div.className = "seg" + (idx===activeSegIndex ? " active" : "");
+    const color = speedColor(seg.officialSpeed);
+    div.innerHTML = `
+      <div class="top">
+        <span><span class="dot" style="background:${color}"></span>${idx+1}. szakasz</span>
+        <span>${formatKm(seg.distanceKm)}</span>
+      </div>
+      <div class="meta">Hivatalos: ${seg.officialSpeed ? seg.officialSpeed + " km/h" : "nincs adat (becslés: " + CONFIG.fallbackSpeedKmh + " km/h-val számolva)"}</div>
+      <div class="speedrow">
+        <label>Te ennyivel mennél:</label>
+        <input type="number" min="1" max="300" step="5" value="${seg.userSpeed}" data-idx="${idx}">
+        <span>km/h</span>
+      </div>
+    `;
+    div.addEventListener("click", (e)=>{
+      if(e.target.tagName==="INPUT") return;
+      activeSegIndex = idx; renderSegmentList(); highlightSeg(idx);
+    });
+    const input = div.querySelector("input");
+    input.addEventListener("input", ()=>{
+      const v = Math.max(1, Number(input.value)||seg.userSpeed);
+      segments[idx].userSpeed = v;
+      updateSummary();
+    });
+    wrap.appendChild(div);
+  });
+}
+
+function updateSummary(){
+  const totalKm = segments.reduce((a,s)=>a+s.distanceKm, 0);
+  const officialH = segments.reduce((a,s)=>a + s.distanceKm/(s.officialSpeed || CONFIG.fallbackSpeedKmh), 0);
+  const customH = segments.reduce((a,s)=>a + s.distanceKm/s.userSpeed, 0);
+  const diffH = officialH - customH;
+
+  document.getElementById("summary").hidden = segments.length===0;
+  document.getElementById("sumDistance").textContent = formatKm(totalKm);
+  document.getElementById("sumOfficial").textContent = formatHours(officialH);
+  document.getElementById("sumCustom").textContent = formatHours(customH);
+  const diffEl = document.getElementById("sumDiff");
+  if(Math.abs(diffH*60) < 1){
+    diffEl.textContent = "Kb. ugyanannyi idő alatt érnél oda.";
+    diffEl.className = "diff";
+  } else if(diffH > 0){
+    diffEl.textContent = `⏱ ${formatHours(diffH)}-t spórolnál`;
+    diffEl.className = "diff pos";
+  } else {
+    diffEl.textContent = `⏱ ${formatHours(-diffH)}-vel tovább tartana`;
+    diffEl.className = "diff neg";
+  }
+}
+
+// ============================= UI ESEMÉNYEK =============================
+
+document.getElementById("fromSearchBtn").addEventListener("click", async ()=>{
+  const q = document.getElementById("fromInput").value.trim();
+  if(!q) return;
+  setStatus("Keresés: " + q + "…");
+  try{ setPoint("from", await geocode(q)); map.setView([fromPoint.lat, fromPoint.lon], 12); setStatus(""); }
+  catch(err){ setStatus(err.message, true); }
+});
+document.getElementById("toSearchBtn").addEventListener("click", async ()=>{
+  const q = document.getElementById("toInput").value.trim();
+  if(!q) return;
+  setStatus("Keresés: " + q + "…");
+  try{ setPoint("to", await geocode(q)); map.setView([toPoint.lat, toPoint.lon], 12); setStatus(""); }
+  catch(err){ setStatus(err.message, true); }
+});
+["fromInput","toInput"].forEach(id=>{
+  document.getElementById(id).addEventListener("keydown", (e)=>{
+    if(e.key==="Enter"){ e.preventDefault(); document.getElementById(id==="fromInput"?"fromSearchBtn":"toSearchBtn").click(); }
+  });
+});
+document.getElementById("pickFromBtn").addEventListener("click", ()=> armPickMode(pickMode==="from"?null:"from"));
+document.getElementById("pickToBtn").addEventListener("click", ()=> armPickMode(pickMode==="to"?null:"to"));
+document.getElementById("calcBtn").addEventListener("click", calculateRoute);
+
+initMap();
+</script>
+</body>
+</html>
